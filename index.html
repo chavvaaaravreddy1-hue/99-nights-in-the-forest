@@ -1,0 +1,1031 @@
+-- AllInOne.server
+-- Single-file "99 Nights in a Forest" system + currency + shop + data persistence
+-- Place this script in ServerScriptService.
+-- If automatic LocalScript creation fails (some runtime environments disallow setting LocalScript.Source),
+-- copy the CLIENT LOCAL SCRIPT (the block at the end of this file) into StarterPlayer > StarterPlayerScripts as a LocalScript.
+
+-- Services
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local DataStoreService = game:GetService("DataStoreService")
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+
+-- ========== CONFIG ==========
+local Config = {}
+
+-- Currency
+Config.CurrencyName = "Coins"
+Config.StartingCoins = 100
+Config.DataStoreName = "CB_99Nights_Save_v1" -- change to reset all saves
+
+-- Daily reward
+Config.DailyReward = {
+    Amount = 50,
+    CooldownHours = 20
+}
+
+-- Shop catalog
+Config.Shop = {
+    { Id = "speed_boost", DisplayName = "Speed Boost", Price = 150, Grant = "SpeedBoost" },
+    { Id = "red_trail", DisplayName = "Red Trail", Price = 75, Grant = "TrailRed" },
+    { Id = "campfire_skin", DisplayName = "Campfire Skin", Price = 200, Grant = "CampfireSkin" }
+}
+
+-- Night system
+Config.DayLength = 120 -- seconds per full day (day+night). Adjust as desired.
+Config.NightFraction = 0.45 -- fraction of a full cycle that is night (0.0-1.0)
+Config.MaxNights = 99
+
+-- Coin spawner
+Config.CoinSpawn = {
+    Enabled = true,
+    CoinValue = 5,
+    MaxCoins = 20,
+    SpawnInterval = {Min = 3, Max = 8},
+    SpawnRegionCenter = Vector3.new(0, 3, 0),
+    SpawnRegionSize = Vector3.new(120, 10, 120),
+    Lifetime = 60 -- seconds before a spawned coin auto-deletes
+}
+
+-- Enemy spawn (night)
+Config.Enemy = {
+    Enabled = true,
+    SpawnPerNight = 3,
+    MaxActive = 8,
+    SpawnDistanceFromPlayers = 30,
+    Damage = 10,
+    Health = 40,
+    RespawnOnDeath = false
+}
+
+-- Campfire safe zone
+Config.Campfire = {
+    SafeRadius = 20,
+    SleepTimeSkipFraction = 0.95, -- fraction of night to skip when sleeping
+    CampfireModelName = "CB_Campfire" -- server will create if not found in workspace
+}
+
+-- SpeedBoost behavior
+Config.SpeedBoost = {
+    WalkSpeed = 28
+}
+
+-- Data saving intervals
+Config.AutoSaveInterval = 60 -- seconds
+-- ============================
+
+-- ========== REMOTES ==========
+local remoteFolder = ReplicatedStorage:FindFirstChild("CB_Remotes")
+if not remoteFolder then
+    remoteFolder = Instance.new("Folder")
+    remoteFolder.Name = "CB_Remotes"
+    remoteFolder.Parent = ReplicatedStorage
+end
+
+local RemoteRequestCatalog = Instance.new("RemoteFunction")
+RemoteRequestCatalog.Name = "RequestCatalog"
+RemoteRequestCatalog.Parent = remoteFolder
+
+local RemoteRequestPurchase = Instance.new("RemoteEvent")
+RemoteRequestPurchase.Name = "RequestPurchase"
+RemoteRequestPurchase.Parent = remoteFolder
+
+local RemoteRequestDaily = Instance.new("RemoteFunction")
+RemoteRequestDaily.Name = "RequestDailyReward"
+RemoteRequestDaily.Parent = remoteFolder
+
+local RemoteOpenShopNotification = Instance.new("RemoteEvent")
+RemoteOpenShopNotification.Name = "OpenShopNotification"
+RemoteOpenShopNotification.Parent = remoteFolder
+
+local RemoteNightUpdate = Instance.new("RemoteEvent")
+RemoteNightUpdate.Name = "NightUpdate" -- tells clients current day/night progress, isNight boolean, nightNumber
+RemoteNightUpdate.Parent = remoteFolder
+
+local RemoteGrantEffect = Instance.new("RemoteEvent")
+RemoteGrantEffect.Name = "GrantEffect" -- cosmetic effects (client)
+RemoteGrantEffect.Parent = remoteFolder
+-- ============================
+
+-- ========== DATASTORE ==========
+local ds = DataStoreService:GetDataStore(Config.DataStoreName)
+local function safeCall(fn, ...)
+    local ok, res = pcall(fn, ...)
+    if not ok then
+        warn("DataStore call failed:", res)
+        return nil, res
+    end
+    return res
+end
+-- ============================
+
+-- ========== SESSION STATE ==========
+-- Session per player
+-- Session[player.UserId] = {
+--   Owned = { [grantTag] = true },
+--   LastDailyUTC = number,
+--   NightsSurvived = number,
+--   LastNightTime = number (os.time),
+--   Coins = number
+-- }
+local Session = {}
+
+-- Index shop by Id
+local ShopById = {}
+for _, item in ipairs(Config.Shop) do
+    ShopById[item.Id] = item
+end
+-- ============================
+
+-- ========== UTILITIES ==========
+local function makeFolder(parent, name)
+    local f = parent:FindFirstChild(name)
+    if not f then
+        f = Instance.new("Folder")
+        f.Name = name
+        f.Parent = parent
+    end
+    return f
+end
+
+local function createLeaderstats(player, starting)
+    local ls = Instance.new("Folder")
+    ls.Name = "leaderstats"
+    ls.Parent = player
+    local coins = Instance.new("IntValue")
+    coins.Name = Config.CurrencyName
+    coins.Value = starting or Config.StartingCoins
+    coins.Parent = ls
+    return coins
+end
+
+local function getCoins(player)
+    local ls = player:FindFirstChild("leaderstats")
+    if not ls then
+        return nil
+    end
+    local c = ls:FindFirstChild(Config.CurrencyName)
+    if c then return c end
+    return nil
+end
+
+local function changeCoins(player, delta)
+    local c = getCoins(player)
+    if not c then return false end
+    c.Value = math.max(0, c.Value + delta)
+    return true
+end
+
+local function playerSaveKey(userId)
+    return "user_"..tostring(userId)
+end
+-- ============================
+
+-- ========== GRANT HANDLERS ==========
+-- Create an asset cache in ServerStorage
+local assetCache = ServerStorage:FindFirstChild("CB_Assets")
+if not assetCache then
+    assetCache = Instance.new("Folder")
+    assetCache.Name = "CB_Assets"
+    assetCache.Parent = ServerStorage
+end
+
+local function getSpeedTool()
+    local existing = assetCache:FindFirstChild("CB_SpeedTool")
+    if existing then return existing end
+    local tool = Instance.new("Tool")
+    tool.Name = "Speed Boost"
+    tool.CanBeDropped = false
+    tool.RequiresHandle = true
+    local handle = Instance.new("Part")
+    handle.Name = "Handle"
+    handle.Size = Vector3.new(0.6,0.6,0.6)
+    handle.Color = Color3.fromRGB(255, 200, 60)
+    handle.Material = Enum.Material.Neon
+    handle.Parent = tool
+    local pe = Instance.new("ParticleEmitter")
+    pe.Rate = 8
+    pe.Size = NumberSequence.new(0.5)
+    pe.LightEmission = 0.7
+    pe.Parent = handle
+
+    -- Equip behavior server-side: set WalkSpeed
+    tool.Equipped:Connect(function()
+        local char = tool.Parent
+        if not char then return end
+        local hum = char:FindFirstChildWhichIsA("Humanoid")
+        if hum then hum.WalkSpeed = Config.SpeedBoost.WalkSpeed end
+    end)
+    tool.Unequipped:Connect(function()
+        local char = tool.Parent
+        if not char then return end
+        local hum = char:FindFirstChildWhichIsA("Humanoid")
+        if hum then hum.WalkSpeed = 16 end
+    end)
+    tool.Parent = assetCache
+    return tool
+end
+
+local function applyTrail(player, color)
+    local char = player.Character
+    if not char then return end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+    -- Remove old
+    for _,c in ipairs(root:GetChildren()) do
+        if c:IsA("Trail") and c.Name == "CB_Trail" then c:Destroy() end
+    end
+    local a0 = Instance.new("Attachment", root)
+    a0.Name = "CB_Trail_Att0"
+    a0.Position = Vector3.new(0,0.5,0)
+    local a1 = Instance.new("Attachment", root)
+    a1.Name = "CB_Trail_Att1"
+    a1.Position = Vector3.new(0,-0.5,0)
+    local trail = Instance.new("Trail", root)
+    trail.Name = "CB_Trail"
+    trail.Attachment0 = a0
+    trail.Attachment1 = a1
+    trail.Lifetime = 0.5
+    trail.Color = ColorSequence.new(color)
+    trail.Parent = root
+end
+
+local function grantToPlayer(player, grantTag)
+    local session = Session[player.UserId]
+    if not session then return end
+    session.Owned[grantTag] = true
+
+    -- Server-side grants
+    if grantTag == "SpeedBoost" then
+        -- give tool to backpack
+        local bp = player:FindFirstChildOfClass("Backpack")
+        if bp then
+            local tool = getSpeedTool():Clone()
+            tool.Parent = bp
+        end
+    elseif grantTag == "TrailRed" then
+        -- apply to current character (client cosmetic will be requested too)
+        applyTrail(player, Color3.fromRGB(255,64,64))
+        RemoteGrantEffect:FireClient(player, "TrailRed")
+    elseif grantTag == "CampfireSkin" then
+        -- Cosmetic: clients can respond to this
+        RemoteGrantEffect:FireClient(player, "CampfireSkin")
+    end
+end
+-- ============================
+
+-- ========== SAVE/LOAD ==========
+local function loadPlayerData(player)
+    local key = playerSaveKey(player.UserId)
+    local ok, data = pcall(function() return ds:GetAsync(key) end)
+    if not ok then
+        warn("Failed to load data for", player.Name)
+        -- initialize fresh
+        Session[player.UserId] = { Owned = {}, LastDailyUTC = nil, NightsSurvived = 0, Coins = Config.StartingCoins }
+        createLeaderstats(player, Config.StartingCoins)
+        return
+    end
+    if data then
+        Session[player.UserId] = {
+            Owned = data.owned or {},
+            LastDailyUTC = data.lastDailyUTC,
+            NightsSurvived = data.nights or 0,
+            Coins = data.coins or Config.StartingCoins
+        }
+    else
+        Session[player.UserId] = { Owned = {}, LastDailyUTC = nil, NightsSurvived = 0, Coins = Config.StartingCoins }
+    end
+    createLeaderstats(player, Session[player.UserId].Coins)
+end
+
+local function savePlayerData(player)
+    local session = Session[player.UserId]
+    if not session then return end
+    local ls = player:FindFirstChild("leaderstats")
+    if ls and ls:FindFirstChild(Config.CurrencyName) then
+        session.Coins = ls[Config.CurrencyName].Value
+    end
+    local key = playerSaveKey(player.UserId)
+    local payload = {
+        owned = session.Owned,
+        lastDailyUTC = session.LastDailyUTC,
+        nights = session.NightsSurvived,
+        coins = session.Coins
+    }
+    local ok, err = pcall(function() ds:SetAsync(key, payload) end)
+    if not ok then warn("Failed to save for", player.Name, ":", err) end
+end
+
+-- Auto-save loop
+spawn(function()
+    while true do
+        task.wait(Config.AutoSaveInterval)
+        for _, p in ipairs(Players:GetPlayers()) do
+            pcall(savePlayerData, p)
+        end
+    end
+end)
+-- ============================
+
+-- ========== PLAYER HANDLERS ==========
+Players.PlayerAdded:Connect(function(player)
+    -- load & leaderstats
+    loadPlayerData(player)
+
+    -- Give owned grants that are persistent
+    local session = Session[player.UserId]
+    if session and session.Owned then
+        for grantTag, _ in pairs(session.Owned) do
+            grantToPlayer(player, grantTag)
+        end
+    end
+
+    -- Character added: reapply trail and re-equip speed if owned
+    player.CharacterAdded:Connect(function(char)
+        task.wait(0.25)
+        local session = Session[player.UserId]
+        if session and session.Owned then
+            if session.Owned["TrailRed"] then
+                applyTrail(player, Color3.fromRGB(255,64,64))
+            end
+            if session.Owned["SpeedBoost"] then
+                -- ensure tool in backpack
+                local bp = player:FindFirstChildOfClass("Backpack")
+                if bp and not bp:FindFirstChild("Speed Boost") then
+                    local tool = getSpeedTool():Clone()
+                    tool.Parent = bp
+                end
+            end
+        end
+    end)
+
+    -- Try to inject client LocalScript into PlayerGui (if environment allows)
+    local success, err = pcall(function()
+        local clientCode = script:FindFirstChild("CB_ClientCode")
+        if clientCode and clientCode:IsA("StringValue") then
+            local src = clientCode.Value
+            local ls = Instance.new("LocalScript")
+            ls.Name = "CB_ClientLocal"
+            -- attempt to set source; this may fail in some runtime environments.
+            ls.Source = src
+            ls.Parent = player:WaitForChild("PlayerGui")
+        end
+    end)
+    if not success then
+        warn("Auto-injecting client LocalScript failed. If UI doesn't appear, manually create a LocalScript in StarterPlayerScripts using the client code at the bottom of this script. Error:", tostring(err))
+    end
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+    savePlayerData(player)
+    Session[player.UserId] = nil
+end)
+
+game:BindToClose(function()
+    for _, p in ipairs(Players:GetPlayers()) do
+        pcall(savePlayerData, p)
+    end
+end)
+-- ============================
+
+-- ========== REMOTE HANDLERS (SHOP / DAILY) ==========
+RemoteRequestCatalog.OnServerInvoke = function(player)
+    local public = {}
+    for _, item in ipairs(Config.Shop) do
+        table.insert(public, { Id = item.Id, DisplayName = item.DisplayName, Price = item.Price })
+    end
+    local owned = {}
+    local s = Session[player.UserId]
+    if s and s.Owned then
+        for k,v in pairs(s.Owned) do if v then owned[k] = true end end
+    end
+    return { Catalog = public, Owned = owned, CurrencyName = Config.CurrencyName, Nights = s and s.NightsSurvived or 0 }
+end
+
+RemoteRequestPurchase.OnServerEvent:Connect(function(player, itemId)
+    -- server authoritatively handles purchase
+    local s = Session[player.UserId]
+    if not s then return end
+    local item = ShopById[itemId]
+    if not item then
+        RemoteOpenShopNotification:FireClient(player, false, "Item not found.")
+        return
+    end
+    local coins = getCoins(player)
+    if not coins then return end
+    if coins.Value < item.Price then
+        RemoteOpenShopNotification:FireClient(player, false, "Not enough "..Config.CurrencyName)
+        return
+    end
+    -- charge and grant
+    coins.Value = coins.Value - item.Price
+    grantToPlayer(player, item.Grant)
+    -- mark as owned
+    s.Owned[item.Grant] = true
+    RemoteOpenShopNotification:FireClient(player, true, "Purchased "..item.DisplayName)
+    -- save
+    pcall(savePlayerData, player)
+end)
+
+RemoteRequestDaily.OnServerInvoke = function(player)
+    local s = Session[player.UserId]
+    if not s then return { ok = false, msg = "Session missing." } end
+    local now = os.time()
+    local last = s.LastDailyUTC or 0
+    local hours = (now - last) / 3600
+    if hours < Config.DailyReward.CooldownHours then
+        local remain = math.ceil(Config.DailyReward.CooldownHours - hours)
+        return { ok = false, msg = ("Come back in %d hour(s)."):format(remain) }
+    end
+    -- give
+    local coins = getCoins(player)
+    if not coins then return { ok = false, msg = "leaderstats missing." } end
+    coins.Value = coins.Value + Config.DailyReward.Amount
+    s.LastDailyUTC = now
+    pcall(savePlayerData, player)
+    return { ok = true, amt = Config.DailyReward.Amount }
+end
+-- ============================
+
+-- ========== COIN SPAWNER ==========
+local spawnedCoinsFolder = makeFolder(Workspace, "CB_SpawnedCoins")
+
+local function randomPointInRegion(center, size)
+    local half = size/2
+    local rx = center.X + (math.random() - 0.5) * size.X
+    local ry = center.Y + (math.random() - 0.5) * size.Y
+    local rz = center.Z + (math.random() - 0.5) * size.Z
+    return Vector3.new(rx, ry, rz)
+end
+
+local function makeCoinInstance(value, pos)
+    local part = Instance.new("Part")
+    part.Name = "CB_Coin"
+    part.Size = Vector3.new(1,1,1)
+    part.Shape = Enum.PartType.Ball
+    part.Color = Color3.fromRGB(255, 215, 0)
+    part.Material = Enum.Material.Neon
+    part.CanCollide = false
+    part.Position = pos
+    part.Anchored = false
+    part.Parent = spawnedCoinsFolder
+
+    local val = Instance.new("IntValue")
+    val.Name = "Value"
+    val.Value = value
+    val.Parent = part
+
+    local body = Instance.new("BodyVelocity")
+    body.MaxForce = Vector3.new(0,0,0)
+    body.Parent = part
+
+    -- Touch detection
+    part.Touched:Connect(function(hit)
+        local pl = Players:GetPlayerFromCharacter(hit.Parent)
+        if pl then
+            -- award
+            if changeCoins(pl, value) then
+                part:Destroy()
+            end
+        end
+    end)
+
+    -- float effect
+    local bv = Instance.new("BodyForce", part)
+    bv.Force = Vector3.new(0, part:GetMass()*9.5, 0)
+    Debris:AddItem(part, Config.CoinSpawn.Lifetime)
+    return part
+end
+
+if Config.CoinSpawn.Enabled then
+    spawn(function()
+        while true do
+            local cur = #spawnedCoinsFolder:GetChildren()
+            if cur < Config.CoinSpawn.MaxCoins then
+                local pos = randomPointInRegion(Config.CoinSpawn.SpawnRegionCenter, Config.CoinSpawn.SpawnRegionSize)
+                makeCoinInstance(Config.CoinSpawn.CoinValue, pos)
+            end
+            local waitTime = math.random(Config.CoinSpawn.SpawnInterval.Min*100, Config.CoinSpawn.SpawnInterval.Max*100)/100
+            task.wait(waitTime)
+        end
+    end)
+end
+-- ============================
+
+-- ========== CAMPFIRE SETUP ==========
+-- If no campfire model exists, create a simple one in Workspace for players to interact with
+local campfire = Workspace:FindFirstChild(Config.Campfire.CampfireModelName)
+if not campfire then
+    campfire = Instance.new("Model")
+    campfire.Name = Config.Campfire.CampfireModelName
+    local base = Instance.new("Part")
+    base.Size = Vector3.new(4,1,4)
+    base.Anchored = true
+    base.Position = Vector3.new(0,2,0)
+    base.Name = "Base"
+    base.Parent = campfire
+    local firePart = Instance.new("Part")
+    firePart.Size = Vector3.new(1,1,1)
+    firePart.Position = base.Position + Vector3.new(0,1,0)
+    firePart.Anchored = true
+    firePart.Color = Color3.fromRGB(255,100,0)
+    firePart.Name = "Fire"
+    firePart.Parent = campfire
+    local fire = Instance.new("Fire")
+    fire.Parent = firePart
+    campfire.Parent = Workspace
+end
+
+-- Returns true if position is within campfire safe radius
+local function isWithinCampfire(pos)
+    local base = campfire:FindFirstChild("Base")
+    if not base then return false end
+    local dist = (pos - base.Position).Magnitude
+    return dist <= Config.Campfire.SafeRadius
+end
+-- ============================
+
+-- ========== NIGHT & DAY CYCLE ==========
+local cycleStart = tick()
+local cycleLength = Config.DayLength
+local nightLength = cycleLength * Config.NightFraction
+local dayLength = cycleLength - nightLength
+local currentNightNumber = 0
+
+-- Compute whether current time in cycle is night
+local function getCycleState()
+    local elapsed = (tick() - cycleStart) % cycleLength
+    local isNight = elapsed >= dayLength
+    local progress = elapsed / cycleLength -- 0..1
+    return {
+        elapsed = elapsed,
+        progress = progress,
+        isNight = isNight,
+        timeInPhase = isNight and (elapsed - dayLength) or elapsed,
+        nightNumber = currentNightNumber
+    }
+end
+
+-- A small table to keep track of active enemy NPCs
+local activeEnemies = {}
+
+-- Simple enemy spawner function
+local function spawnEnemyNearPlayer(player)
+    if not Config.Enemy.Enabled then return end
+    if #activeEnemies >= Config.Enemy.MaxActive then return end
+    local char = player.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return end
+    local pr = char.HumanoidRootPart.Position
+    -- pick a point at distance
+    local angle = math.random() * math.pi * 2
+    local offset = Vector3.new(math.cos(angle), 0, math.sin(angle)) * Config.Enemy.SpawnDistanceFromPlayers
+    local pos = pr + offset + Vector3.new(0, 2, 0)
+    -- Create a basic humanoid enemy
+    local m = Instance.new("Model")
+    m.Name = "CB_Enemy"
+    local torso = Instance.new("Part")
+    torso.Size = Vector3.new(2,2,1)
+    torso.Position = pos
+    torso.Anchored = false
+    torso.Name = "Torso"
+    torso.Parent = m
+    local head = Instance.new("Part")
+    head.Size = Vector3.new(1,1,1)
+    head.Position = pos + Vector3.new(0,1.5,0)
+    head.Name = "Head"
+    head.Parent = m
+    local humanoid = Instance.new("Humanoid")
+    humanoid.MaxHealth = Config.Enemy.Health
+    humanoid.Health = Config.Enemy.Health
+    humanoid.Parent = m
+    m.PrimaryPart = torso
+    m.Parent = Workspace
+    activeEnemies[#activeEnemies+1] = m
+
+    -- Basic AI: walk toward nearest player
+    spawn(function()
+        while m.Parent and humanoid.Health > 0 do
+            local targetPlayer
+            local bestDist = math.huge
+            for _, p in pairs(Players:GetPlayers()) do
+                local c = p.Character
+                if c and c:FindFirstChild("HumanoidRootPart") then
+                    local d = (c.HumanoidRootPart.Position - m.PrimaryPart.Position).Magnitude
+                    if d < bestDist then bestDist = d; targetPlayer = p end
+                end
+            end
+            if targetPlayer and targetPlayer.Character and targetPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                local tr = targetPlayer.Character.HumanoidRootPart.Position
+                local dir = (tr - m.PrimaryPart.Position).Unit
+                local move = dir * 8
+                m:SetPrimaryPartCFrame(m.PrimaryPart.CFrame + dir * 1)
+                if bestDist < 3 then
+                    -- attack
+                    local hum = targetPlayer.Character:FindFirstChildWhichIsA("Humanoid")
+                    if hum and hum.Health > 0 then
+                        hum:TakeDamage(Config.Enemy.Damage)
+                    end
+                end
+            end
+            task.wait(0.6)
+        end
+    end)
+
+    humanoid.Died:Connect(function()
+        -- remove from activeEnemies
+        for i, v in ipairs(activeEnemies) do if v == m then table.remove(activeEnemies, i); break end end
+        Debris:AddItem(m, 2)
+    end)
+end
+
+-- Night transition handler (called frequently)
+spawn(function()
+    local prevIsNight = false
+    while true do
+        local state = getCycleState()
+        if state.isNight and not prevIsNight then
+            -- night began
+            currentNightNumber = currentNightNumber + 1
+            print("Night began: "..tostring(currentNightNumber))
+            -- spawn enemies near players
+            for _, p in ipairs(Players:GetPlayers()) do
+                for i=1, Config.Enemy.SpawnPerNight do
+                    spawnEnemyNearPlayer(p)
+                end
+            end
+            -- Night reward or milestone checks
+            for _, p in ipairs(Players:GetPlayers()) do
+                local s = Session[p.UserId]
+                if s then
+                    -- increment nights survived if player was active at end of night (we'll check on day start)
+                    -- we will record at day->night transitions further below
+                end
+            end
+        end
+
+        -- when day begins (night just ended), award players who survived the night
+        if not state.isNight and prevIsNight then
+            print("Day began after night", tostring(currentNightNumber))
+            -- Determine survivors: players whose characters are alive and not inside active enemy or dead
+            for _, p in ipairs(Players:GetPlayers()) do
+                local survived = false
+                local char = p.Character
+                local hum = char and char:FindFirstChildWhichIsA("Humanoid")
+                if hum and hum.Health > 0 then
+                    survived = true
+                end
+                if survived then
+                    local s = Session[p.UserId]
+                    if s then
+                        s.NightsSurvived = math.min(Config.MaxNights, s.NightsSurvived + 1)
+                        -- reward coins for surviving
+                        local coins = getCoins(p)
+                        if coins then
+                            local reward = 30 + math.floor(s.NightsSurvived / 3)
+                            coins.Value = coins.Value + reward
+                            RemoteOpenShopNotification:FireClient(p, true, ("Survived the night! +%d %s"):format(reward, Config.CurrencyName))
+                        end
+                        -- milestone: if reached a milestone (e.g., 10, 25, 50, 99) grant something
+                        if s.NightsSurvived == 10 then
+                            grantToPlayer(p, "TrailRed")
+                        elseif s.NightsSurvived == 25 then
+                            grantToPlayer(p, "SpeedBoost")
+                        elseif s.NightsSurvived == 50 then
+                            grantToPlayer(p, "CampfireSkin")
+                        elseif s.NightsSurvived == 99 then
+                            -- special event: give a big reward
+                            local coins = getCoins(p)
+                            if coins then coins.Value = coins.Value + 1000 end
+                            RemoteOpenShopNotification:FireClient(p, true, "Champion of 99 Nights! +1000 Coins")
+                        end
+                        pcall(savePlayerData, p)
+                    end
+                else
+                    -- player died; potential penalty (none by default)
+                    RemoteOpenShopNotification:FireClient(p, false, "You did not survive the night.")
+                end
+            end
+        end
+
+        -- Broadcast night state to clients for HUD
+        for _, p in ipairs(Players:GetPlayers()) do
+            local ok = p
+            RemoteNightUpdate:FireClient(p, { isNight = state.isNight, progress = state.progress, nightNumber = currentNightNumber })
+        end
+
+        prevIsNight = state.isNight
+        task.wait(1)
+    end
+end)
+-- ============================
+
+-- ========== SLEEP / SKIP NIGHT MECHANIC ==========
+-- Players can sleep at campfire to skip most of night.
+-- We'll expose a server function that tries to sleep a player if near campfire.
+local function trySleep(player)
+    local char = player.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return false, "No character." end
+    local pos = char.HumanoidRootPart.Position
+    if not isWithinCampfire(pos) then return false, "You must be at the campfire to sleep." end
+
+    -- compute current cycle
+    local state = getCycleState()
+    if not state.isNight then return false, "You can only sleep during the night." end
+
+    -- Skip ahead by fraction of night
+    local elapsed = (tick() - cycleStart) % cycleLength
+    local newElapsed = dayLength + nightLength * Config.Campfire.SleepTimeSkipFraction
+    -- Adjust cycleStart so that tick() - cycleStart has newElapsed
+    cycleStart = tick() - newElapsed
+    return true, "You sleep peacefully; night moves toward dawn."
+end
+
+-- Expose a RemoteEvent for sleeping
+local RemoteSleepAttempt = Instance.new("RemoteFunction")
+RemoteSleepAttempt.Name = "RequestSleep"
+RemoteSleepAttempt.Parent = remoteFolder
+
+RemoteSleepAttempt.OnServerInvoke = function(player)
+    local ok, msg = trySleep(player)
+    return { ok = ok, msg = msg }
+end
+-- ============================
+
+-- ========== CLIENT LOCAL SCRIPT STORAGE ==========
+-- We'll store client code in a StringValue child so we can inject it into PlayerGui on join.
+-- If the runtime doesn't allow setting LocalScript.Source, user will need to copy the client code (block below) manually to StarterPlayerScripts.
+local clientString = [[
+-- CLIENT SIDE: Minimal UI + handlers for shop, daily reward, night HUD.
+-- This LocalScript is intended to run in PlayerGui or StarterPlayerScripts.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+local rs = ReplicatedStorage:WaitForChild("CB_Remotes")
+
+local RequestCatalog = rs:WaitForChild("RequestCatalog")
+local RequestPurchase = rs:WaitForChild("RequestPurchase")
+local RequestDailyReward = rs:WaitForChild("RequestDailyReward")
+local OpenShopNotification = rs:WaitForChild("OpenShopNotification")
+local NightUpdate = rs:WaitForChild("NightUpdate")
+local RequestSleep = rs:WaitForChild("RequestSleep")
+local GrantEffect = rs:WaitForChild("GrantEffect")
+
+-- Build a simple ScreenGui
+local screen = Instance.new("ScreenGui")
+screen.Name = "CB_99NightsUI"
+screen.ResetOnSpawn = false
+screen.Parent = player:WaitForChild("PlayerGui")
+
+-- Top-left: currency and nights
+local topFrame = Instance.new("Frame")
+topFrame.Name = "TopFrame"
+topFrame.Size = UDim2.new(0, 300, 0, 60)
+topFrame.Position = UDim2.new(0, 10, 0, 10)
+topFrame.BackgroundTransparency = 0.25
+topFrame.BackgroundColor3 = Color3.fromRGB(20,20,20)
+topFrame.Parent = screen
+local coinLabel = Instance.new("TextLabel")
+coinLabel.Size = UDim2.new(0, 200, 1, 0)
+coinLabel.Position = UDim2.new(0,0,0,0)
+coinLabel.BackgroundTransparency = 1
+coinLabel.TextColor3 = Color3.new(1,1,1)
+coinLabel.Font = Enum.Font.SourceSansBold
+coinLabel.TextScaled = true
+coinLabel.Text = "Coins: --"
+coinLabel.Parent = topFrame
+
+local nightLabel = Instance.new("TextLabel")
+nightLabel.Size = UDim2.new(0, 90, 1, 0)
+nightLabel.Position = UDim2.new(0, 205, 0, 0)
+nightLabel.BackgroundTransparency = 1
+nightLabel.TextColor3 = Color3.new(1,1,1)
+nightLabel.Font = Enum.Font.SourceSansBold
+nightLabel.TextScaled = true
+nightLabel.Text = "Night: 0"
+nightLabel.Parent = topFrame
+
+-- Shop button bottom-left
+local shopBtn = Instance.new("TextButton")
+shopBtn.Name = "ShopBtn"
+shopBtn.Size = UDim2.new(0, 140, 0, 40)
+shopBtn.Position = UDim2.new(0, 10, 1, -60)
+shopBtn.Text = "Shop"
+shopBtn.Parent = screen
+
+-- Daily reward button
+local dailyBtn = Instance.new("TextButton")
+dailyBtn.Name = "DailyBtn"
+dailyBtn.Size = UDim2.new(0, 140, 0, 40)
+dailyBtn.Position = UDim2.new(0, 160, 1, -60)
+dailyBtn.Text = "Daily"
+dailyBtn.Parent = screen
+
+-- Sleep button (only usable near campfire at night)
+local sleepBtn = Instance.new("TextButton")
+sleepBtn.Name = "SleepBtn"
+sleepBtn.Size = UDim2.new(0, 140, 0, 40)
+sleepBtn.Position = UDim2.new(1, -150, 1, -60)
+sleepBtn.Text = "Sleep (Campfire)"
+sleepBtn.Parent = screen
+
+-- Shop window
+local shopWindow = Instance.new("Frame")
+shopWindow.Name = "ShopWindow"
+shopWindow.Size = UDim2.new(0, 420, 0, 320)
+shopWindow.Position = UDim2.new(0.5, -210, 0.5, -160)
+shopWindow.BackgroundTransparency = 0.1
+shopWindow.BackgroundColor3 = Color3.fromRGB(30,30,30)
+shopWindow.Visible = false
+shopWindow.Parent = screen
+
+local closeShop = Instance.new("TextButton", shopWindow)
+closeShop.Size = UDim2.new(0, 60, 0, 30)
+closeShop.Position = UDim2.new(1, -70, 0, 10)
+closeShop.Text = "Close"
+
+local itemsFrame = Instance.new("ScrollingFrame", shopWindow)
+itemsFrame.Size = UDim2.new(1, -10, 1, -50)
+itemsFrame.Position = UDim2.new(0,5,0,40)
+itemsFrame.CanvasSize = UDim2.new(0,0,0,0)
+itemsFrame.BackgroundTransparency = 1
+itemsFrame.ScrollBarThickness = 6
+
+local function refreshCatalog()
+    local result = RequestCatalog:InvokeServer()
+    -- set coin display
+    local ls = player:FindFirstChild("leaderstats")
+    if ls and ls:FindFirstChild(result.CurrencyName) then
+        coinLabel.Text = result.CurrencyName..": "..tostring(ls[result.CurrencyName].Value)
+        ls[result.CurrencyName].Changed:Connect(function()
+            coinLabel.Text = result.CurrencyName..": "..tostring(ls[result.CurrencyName].Value)
+        end)
+    end
+    nightLabel.Text = "Night: "..tostring(result.Nights or 0)
+    -- fill items
+    for _, child in ipairs(itemsFrame:GetChildren()) do
+        if child:IsA("Frame") then child:Destroy() end
+    end
+    local y = 0
+    for i, item in ipairs(result.Catalog) do
+        local f = Instance.new("Frame", itemsFrame)
+        f.Size = UDim2.new(1, -10, 0, 50)
+        f.Position = UDim2.new(0, 5, 0, y)
+        f.BackgroundTransparency = 0.2
+        f.BackgroundColor3 = Color3.fromRGB(40,40,40)
+        local t = Instance.new("TextLabel", f)
+        t.Size = UDim2.new(0.6, 0, 1, 0)
+        t.Text = item.DisplayName
+        t.TextColor3 = Color3.new(1,1,1)
+        t.BackgroundTransparency = 1
+        t.TextScaled = true
+        local p = Instance.new("TextLabel", f)
+        p.Size = UDim2.new(0.2,0,1,0)
+        p.Position = UDim2.new(0.6,0,0,0)
+        p.BackgroundTransparency = 1
+        p.Text = tostring(item.Price)
+        p.TextColor3 = Color3.new(1,1,1)
+        p.TextScaled = true
+        local buy = Instance.new("TextButton", f)
+        buy.Size = UDim2.new(0.2,0,1,0)
+        buy.Position = UDim2.new(0.8,0,0,0)
+        buy.Text = "Buy"
+        buy.MouseButton1Click:Connect(function()
+            RequestPurchase:FireServer(item.Id)
+            task.wait(0.15)
+            refreshCatalog()
+        end)
+        y = y + 55
+    end
+    itemsFrame.CanvasSize = UDim2.new(0,0,0,y)
+end
+
+shopBtn.MouseButton1Click:Connect(function()
+    shopWindow.Visible = true
+    refreshCatalog()
+end)
+closeShop.MouseButton1Click:Connect(function() shopWindow.Visible = false end)
+
+dailyBtn.MouseButton1Click:Connect(function()
+    local res = RequestDailyReward:InvokeServer()
+    if res.ok then
+        -- show success
+        coinLabel.Text = coinLabel.Text -- leaderstats will update automatically
+        local m = Instance.new("TextLabel", screen)
+        m.Size = UDim2.new(0,200,0,50)
+        m.Position = UDim2.new(0.5,-100,0.2,0)
+        m.Text = "Daily Claimed: +"..tostring(res.amt)
+        m.TextColor3 = Color3.new(0,1,0)
+        m.BackgroundTransparency = 0.5
+        Debris:AddItem(m, 2)
+    else
+        local m = Instance.new("TextLabel", screen)
+        m.Size = UDim2.new(0,240,0,50)
+        m.Position = UDim2.new(0.5,-120,0.2,0)
+        m.Text = res.msg
+        m.TextColor3 = Color3.new(1,0.5,0)
+        m.BackgroundTransparency = 0.5
+        Debris:AddItem(m, 2)
+    end
+end)
+
+-- receive shop notifications
+OpenShopNotification.OnClientEvent:Connect(function(success, msg)
+    local t = Instance.new("TextLabel", screen)
+    t.Size = UDim2.new(0, 300, 0, 50)
+    t.Position = UDim2.new(0.5, -150, 0.85, 0)
+    t.BackgroundTransparency = 0.4
+    t.Text = msg
+    t.TextColor3 = success and Color3.new(0,1,0) or Color3.new(1,0.3,0.3)
+    Debris:AddItem(t, 2.5)
+    refreshCatalog()
+end)
+
+-- Night updates: update skybox or simple indicator
+NightUpdate.OnClientEvent:Connect(function(data)
+    if data.isNight then
+        -- darken the screen slightly
+        screen.Rotation = 0
+        nightLabel.Text = "Night: "..tostring(data.nightNumber)
+    else
+        nightLabel.Text = "Night: "..tostring(data.nightNumber)
+    end
+end)
+
+-- Sleep button
+sleepBtn.MouseButton1Click:Connect(function()
+    local res = RequestSleep:InvokeServer()
+    if res.ok then
+        local t = Instance.new("TextLabel", screen)
+        t.Size = UDim2.new(0,200,0,50)
+        t.Position = UDim2.new(0.5,-100,0.3,0)
+        t.Text = res.msg
+        t.TextColor3 = Color3.new(0,1,0)
+        Debris:AddItem(t, 2)
+    else
+        local t = Instance.new("TextLabel", screen)
+        t.Size = UDim2.new(0,260,0,50)
+        t.Position = UDim2.new(0.5,-130,0.3,0)
+        t.Text = res.msg
+        t.TextColor3 = Color3.new(1,0.5,0)
+        Debris:AddItem(t, 2)
+    end
+end)
+
+-- Handle grant effects from server (simple visuals)
+GrantEffect.OnClientEvent:Connect(function(tag)
+    if tag == "TrailRed" then
+        -- request to add trail via local code if available
+        local char = player.Character
+        if char and char:FindFirstChild("HumanoidRootPart") then
+            local root = char.HumanoidRootPart
+            -- create attachments/trail
+            for _,v in ipairs(root:GetChildren()) do if v.Name == "CB_Trail" then v:Destroy() end end
+            local a0 = Instance.new("Attachment", root); a0.Name = "CB_Trail_Att0"; a0.Position = Vector3.new(0,0.5,0)
+            local a1 = Instance.new("Attachment", root); a1.Name = "CB_Trail_Att1"; a1.Position = Vector3.new(0,-0.5,0)
+            local trail = Instance.new("Trail", root); trail.Name = "CB_Trail"; trail.Attachment0 = a0; trail.Attachment1 = a1; trail.Color = ColorSequence.new(Color3.fromRGB(255,64,64)); trail.Parent = root
+        end
+    elseif tag == "CampfireSkin" then
+        -- small UI popup
+        local t = Instance.new("TextLabel", screen)
+        t.Size = UDim2.new(0,260,0,50)
+        t.Position = UDim2.new(0.5,-130,0.75,0)
+        t.Text = "Campfire Skin Unlocked!"
+        t.TextColor3 = Color3.new(1,0.8,0)
+        Debris:AddItem(t, 3)
+    end
+end)
+
+-- Initial refresh
+refreshCatalog()
+]]
+
+-- store client string
+local clientSV = script:FindFirstChild("CB_ClientCode")
+if not clientSV then
+    clientSV = Instance.new("StringValue")
+    clientSV.Name = "CB_ClientCode"
+    clientSV.Value = clientString
+    clientSV.Parent = script
+else
+    clientSV.Value = clientString
+end
+-- ============================
+
+-- ========== INSTRUCTIONS FOR MANUAL CLIENT INSTALL (if auto-injection fails) ==========
+-- If you see the warning in Output about failing to inject the LocalScript into PlayerGui,
+-- do the following:
+-- 1) Create a LocalScript under StarterPlayer > StarterPlayerScripts.
+-- 2) Copy the entire client code contained in the StringValue child named "CB_ClientCode" (inside this server Script in Studio).
+-- 3) Paste that code into the LocalScript and save.
+-- This will ensure the client UI and handlers run correctly.
+
+-- ============================
+print("AllInOne.server loaded. System active.")
+-- End of server script.
